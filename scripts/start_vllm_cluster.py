@@ -41,29 +41,8 @@ def get_discovered_models():
     """
     Overrides the hardcoded MODELS_TO_RUN by looking at what we actually have results for.
     """
-    if not RESULTS_FILE.exists():
-        return MODELS_TO_RUN
-        
-    try:
-        with open(RESULTS_FILE, "r") as f:
-            data = json.load(f)
-            
-        verified_models = set()
-        for r in data:
-            if r.get("status") == "success":
-                verified_models.add(r["model"])
-        
-        final_list = []
-        for m in sorted(list(verified_models)):
-            if m in MODEL_TABLE:
-                final_list.append(m)
-                
-        if final_list:
-            return final_list
-            
-    except Exception as e:
-        print(f"Warning: Model discovery failed ({e}). Using default list.")
-        
+    # Bypass verification check for Cluster Launcher
+    # We want to see ALL models, including those that require TP > 1 (which find_max_context might have skipped)
     return MODELS_TO_RUN
 
 # Refresh the list of models to run based on what we found

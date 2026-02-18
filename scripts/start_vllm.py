@@ -41,33 +41,49 @@ def get_discovered_models():
     Overrides the hardcoded MODELS_TO_RUN by looking at what we actually have results for.
     This allows the UI to show all verified models, not just what's enabled for benchmarking.
     """
-    if not RESULTS_FILE.exists():
-        return MODELS_TO_RUN
-        
     try:
-        with open(RESULTS_FILE, "r") as f:
-            data = json.load(f)
-            
-        # 1. Find all models with at least one success
-        verified_models = set()
-        for r in data:
-            if r.get("status") == "success":
-                verified_models.add(r["model"])
-        
-        # 2. Filter: Must be in MODEL_TABLE (so we have config/valid_tp)
-        #    and must be in our verified list
-        final_list = []
-        for m in sorted(list(verified_models)):
-            if m in MODEL_TABLE:
-                final_list.append(m)
+        if RESULTS_FILE.exists():
+            with open(RESULTS_FILE, "r") as f:
+                data = json.load(f)
                 
-        if final_list:
-            return final_list
+            # 1. Find all models with at least one success
+            verified_models = set()
+            for r in data:
+                if r.get("status") == "success":
+                    verified_models.add(r["model"])
+            
+            # 2. Filter: Must be in MODEL_TABLE (so we have config/valid_tp)
+            #    and must be in our verified list (if results exist)
+            final_list = []
+            gpu_count = detect_gpus()
+            
+            for m in sorted(list(verified_models)):
+                if m in MODEL_TABLE:
+                    # Check valid_tp
+                    valid_tps = MODEL_TABLE[m].get("valid_tp", [1])
+                    min_required = min(valid_tps)
+                    
+                    if min_required <= gpu_count:
+                        final_list.append(m)
+                    
+            if final_list:
+                return final_list
             
     except Exception as e:
         print(f"Warning: Model discovery failed ({e}). Using default list.")
         
-    return MODELS_TO_RUN
+    # Fallback if no results file or error: return all models compatible with current hardware
+    gpu_count = detect_gpus()
+    compatible_models = []
+    
+    for m in MODELS_TO_RUN:
+        if m in MODEL_TABLE:
+            valid_tps = MODEL_TABLE[m].get("valid_tp", [1])
+            min_required = min(valid_tps)
+            if min_required <= gpu_count:
+                compatible_models.append(m)
+                
+    return compatible_models
 
 # Refresh the list of models to run based on what we found
 MODELS_TO_RUN = get_discovered_models()

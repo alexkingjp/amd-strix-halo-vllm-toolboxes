@@ -68,12 +68,21 @@ MODEL_TABLE = {
     # 5. Qwen 80B AWQ
     # Size: ~48GB. Fits on 2x32GB (64GB). Leftover for Cache: ~16GB.
     # Config: 20k ctx fits in that cache. Eager mode required for stability.
-     "dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16": {
+    "dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16": {
         "trust_remote": True,
         "valid_tp": [1], # Too big for single GPU
         "max_num_seqs": "64", # Large Model / Bandwidth Constrained
         "max_tokens": "16384", # Lower batch size because Eager mode is CPU intensive
         "enforce_eager": True, 
+        "env": {"VLLM_USE_TRITON_AWQ": "1"} # Fixes "Unsupported Hardware" error
+    },
+
+    "mratsim/MiniMax-M2.5-BF16-INT4-AWQ": {
+        "trust_remote": True,
+        "valid_tp": [2],
+        "max_num_seqs": "64",
+        "max_tokens": "16384",
+        "enforce_eager": False,
         "env": {"VLLM_USE_TRITON_AWQ": "1"} # Fixes "Unsupported Hardware" error
     },
 
@@ -89,6 +98,7 @@ MODELS_TO_RUN = [
     "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit",
     "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit",
     "dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16",
+    "mratsim/MiniMax-M2.5-BF16-INT4-AWQ",
 ]
 
 # Hardware / Global Defaults
