@@ -282,7 +282,10 @@ def configure_and_launch_vllm(model_idx, head_ip):
         "--distributed-executor-backend", "ray",
         "--dtype", "auto"
     ]
-    
+
+    if "Qwen3" in model_id:
+        cmd.extend(["--reasoning-parser", "qwen3"])
+            
     if str(current_seqs) != "auto":
         cmd.extend(["--max-num-seqs", str(current_seqs)])
         
