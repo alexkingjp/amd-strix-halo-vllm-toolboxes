@@ -25,10 +25,53 @@ ENV PIP_NO_CACHE_DIR=1
 RUN printf 'source /opt/venv/bin/activate\n' > /etc/profile.d/venv.sh
 RUN python -m pip install --upgrade pip wheel packaging "setuptools<80.0.0"
 
-# 5. Install PyTorch (TheRock Nightly)
+# 5. Install PyTorch & hipBLASLt from Source with gfx1151 Patches
+# --- Inject patches ---
+COPY patches/hipblaslt_gfx1151.patch /tmp/patches/hipblaslt_gfx1151.patch
+COPY patches/pytorch_gfx1151.patch /tmp/patches/pytorch_gfx1151.patch
+
+ENV PYTORCH_ROCM_ARCH="gfx1151"
+ENV AMDGPU_TARGETS="gfx1151"
+ENV HIP_ARCHITECTURES="gfx1151"
+ENV ROCM_HOME="/opt/rocm"
+ENV HIP_PATH="/opt/rocm"
+ENV CC="/opt/rocm/llvm/bin/clang"
+ENV CXX="/opt/rocm/llvm/bin/clang++"
+
+# --- 5a. Build hipBLASLt from source with FP8 gfx1151 patch ---
+RUN cd /tmp && \
+  git clone https://github.com/ROCm/hipBLASLt.git && \
+  cd hipBLASLt && \
+  git checkout -b feature/gfx1151-scaled-mm-compat && \
+  git apply /tmp/patches/hipblaslt_gfx1151.patch && \
+  mkdir build && cd build && \
+  cmake \
+    -DCMAKE_PREFIX_PATH="/opt/rocm" \
+    -DCMAKE_CXX_COMPILER="/opt/rocm/llvm/bin/clang++" \
+    -DAMDGPU_TARGETS="gfx1151" \
+    -DHIP_PLATFORM=amd \
+    -DBUILD_CLIENTS_TESTS=OFF \
+    -DBUILD_CLIENTS_BENCHMARKS=OFF \
+    .. && \
+  make -j$(nproc) && \
+  make install && \
+  cd /tmp && rm -rf /tmp/hipBLASLt
+
+# --- 5b. Build PyTorch from source with _scaled_mm gfx1151 patch ---
+RUN cd /tmp && \
+  git clone --recursive --depth 1 --shallow-submodules https://github.com/pytorch/pytorch.git && \
+  cd pytorch && \
+  git checkout -b feature/gfx1151-scaled-mm-compat && \
+  git apply /tmp/patches/pytorch_gfx1151.patch && \
+  pip install -r requirements.txt && \
+  MAX_JOBS=4 python setup.py bdist_wheel && \
+  pip install dist/torch*.whl && \
+  cd /tmp && rm -rf /tmp/pytorch
+
+# --- 5c. Install torchaudio & torchvision from TheRock nightly ---
 RUN python -m pip install \
   --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151/ \
-  --pre torch torchaudio torchvision && \
+  --pre torchaudio torchvision && \
   # Fix caching/JSON serialization bug in recent PyTorch nightlies
   sed -i 's/json.dumps(config_dict, sort_keys=True)/json.dumps(config_dict, sort_keys=True, default=str)/g' /opt/venv/lib64/python3.12/site-packages/torch/_dynamo/utils.py
 
@@ -51,7 +94,9 @@ WORKDIR /opt/vllm
 # --- PATCHING ---
 COPY scripts/patch_strix.py /opt/vllm/patch_strix.py
 RUN python /opt/vllm/patch_strix.py && \
-  sed -i 's/gfx1200;gfx1201/gfx1151/' CMakeLists.txt  
+  sed -i 's/gfx1200;gfx1201/gfx1151/' CMakeLists.txt && \
+  # Patch vllm/platforms/rocm.py to return True for is_fp8_fnuz() on gfx1151
+  sed -i 's/def is_fp8_fnuz().*/def is_fp8_fnuz():\n    return True\n\ndef _old_is_fp8_fnuz():/' vllm/platforms/rocm.py || true
 
 # 7. Build vLLM (Wheel Method) with CLANG Host Compiler
 RUN python -m pip install --upgrade cmake ninja packaging wheel numpy "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11

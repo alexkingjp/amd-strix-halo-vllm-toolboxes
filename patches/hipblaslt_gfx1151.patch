@@ -1,0 +1,13 @@
+diff --git a/library/src/amd_detail/hipblaslt-ext.cpp b/library/src/amd_detail/hipblaslt-ext.cpp
+index c1f6b96ec..d330d9aee 100644
+--- a/library/src/amd_detail/hipblaslt-ext.cpp
++++ b/library/src/amd_detail/hipblaslt-ext.cpp
+@@ -606,7 +606,7 @@ namespace hipblaslt_ext
+         using std::begin;
+         using std::end;
+ 
+-        static const std::string fp8Archs[] = {"gfx942", "gfx950"};
++        static const std::string fp8Archs[] = {"gfx942", "gfx950", "gfx1151"};
+         const auto               archName   = rocblaslt_internal_get_arch_name();
+         return std::find(begin(fp8Archs), end(fp8Archs), archName) != end(fp8Archs);
+     }

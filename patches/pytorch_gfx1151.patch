@@ -1,0 +1,45 @@
+diff --git a/aten/src/ATen/Context.cpp b/aten/src/ATen/Context.cpp
+index c342590..3ebe5c4 100644
+--- a/aten/src/ATen/Context.cpp
++++ b/aten/src/ATen/Context.cpp
+@@ -505,7 +505,7 @@ at::BlasBackend Context::blasPreferredBackend() {
+ bool Context::ckSupported() {
+ #ifdef USE_ROCM
+   static const std::vector<std::string> supported_archs = {
+-    "gfx90a", "gfx942", "gfx950"
++    "gfx90a", "gfx942", "gfx950", "gfx1151"
+   };
+   for (auto index : c10::irange(detail::getCUDAHooks().deviceCount())) {
+     if(!detail::getCUDAHooks().isGPUArch(supported_archs, index)) {
+diff --git a/aten/src/ATen/native/cuda/GroupedBlas.cpp b/aten/src/ATen/native/cuda/GroupedBlas.cpp
+index 0f9eb6d..cd86818 100644
+--- a/aten/src/ATen/native/cuda/GroupedBlas.cpp
++++ b/aten/src/ATen/native/cuda/GroupedBlas.cpp
+@@ -79,6 +79,7 @@ bool _scaled_mm_allowed_device(bool sm90_only=false, bool sm100_only=false) {
+ #if ROCM_VERSION >= 60500
+     "gfx950"
+ #endif
++    , "gfx1151"
+ };
+   return at::detail::getCUDAHooks().isGPUArch(archs);
+ #else
+diff --git a/aten/src/ATen/native/cuda/ScaledBlas.cpp b/aten/src/ATen/native/cuda/ScaledBlas.cpp
+index eed87bb..d06e450 100644
+--- a/aten/src/ATen/native/cuda/ScaledBlas.cpp
++++ b/aten/src/ATen/native/cuda/ScaledBlas.cpp
+@@ -79,6 +79,7 @@ bool _scaled_mm_allowed_device(bool sm90_only=false, bool sm100_only=false) {
+ #if ROCM_VERSION >= 60500
+         "gfx950"
+ #endif
++        , "gfx1151"
+     };
+     return at::detail::getCUDAHooks().isGPUArch(archs);
+ #else
+@@ -94,7 +95,7 @@ bool _scaled_mm_allowed_device(bool sm90_only=false, bool sm100_only=false) {
+
+ #ifdef USE_ROCM
+ bool _scaled_mm_is_fnuz() {
+-    return at::detail::getCUDAHooks().isGPUArch({"gfx942"});
++    return at::detail::getCUDAHooks().isGPUArch({"gfx942", "gfx1151"});
+ }
+ #endif
