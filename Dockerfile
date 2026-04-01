@@ -40,6 +40,7 @@ ENV CXX="/opt/rocm/llvm/bin/clang++"
 
 # --- 5a. Build hipBLASLt from source with FP8 gfx1151 patch ---
 RUN cd /tmp && \
+  dnf -y install msgpack-cxx-devel && \
   git clone https://github.com/ROCm/hipBLASLt.git && \
   cd hipBLASLt && \
   git checkout -b feature/gfx1151-scaled-mm-compat && \
