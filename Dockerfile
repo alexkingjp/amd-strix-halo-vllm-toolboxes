@@ -60,6 +60,8 @@ RUN cd /tmp && \
     _deps/rocroller-src/lib/source/Assemblers/InProcessAssembler.cpp && \
   sed -i 's/triple, std::string(target)/llvm::Triple(triple), std::string(target)/' \
     _deps/rocroller-src/lib/source/Assemblers/InProcessAssembler.cpp && \
+  sed -i '1i #include <thread>' \
+    _deps/rocroller-src/lib/source/HIPTimer.cpp && \
   make -j$(nproc) && \
   make install && \
   cd /tmp && rm -rf /tmp/hipBLASLt
