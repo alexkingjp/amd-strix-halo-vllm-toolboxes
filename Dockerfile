@@ -54,6 +54,12 @@ RUN cd /tmp && \
     -DBUILD_CLIENTS_TESTS=OFF \
     -DBUILD_CLIENTS_BENCHMARKS=OFF \
     .. && \
+  sed -i 's/createMCRegInfo(triple)/createMCRegInfo(llvm::Triple(triple))/' \
+    _deps/rocroller-src/lib/source/Assemblers/InProcessAssembler.cpp && \
+  sed -i 's/createMCAsmInfo(\*MRI, triple, mcOptions)/createMCAsmInfo(*MRI, llvm::Triple(triple), mcOptions)/' \
+    _deps/rocroller-src/lib/source/Assemblers/InProcessAssembler.cpp && \
+  sed -i 's/triple, std::string(target)/llvm::Triple(triple), std::string(target)/' \
+    _deps/rocroller-src/lib/source/Assemblers/InProcessAssembler.cpp && \
   make -j$(nproc) && \
   make install && \
   cd /tmp && rm -rf /tmp/hipBLASLt
