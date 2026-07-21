@@ -115,8 +115,9 @@ def setup_head_node(head_ip):
 
 def get_verified_config(model_id, tp_size, max_seqs):
     """Reads max_context_results.json."""
+    model_ctx_default = MODEL_TABLE[model_id].get("ctx", "auto")
     default_config = {
-        "ctx": int(MODEL_TABLE.get(model_id, {}).get("ctx", 8192)),
+        "ctx": model_ctx_default,
         "util": 0.90
     }
     
@@ -138,11 +139,16 @@ def get_verified_config(model_id, tp_size, max_seqs):
             
         matches.sort(key=lambda x: (float(x["util"]), x["max_context_1_user"]), reverse=True)
         best = matches[0]
+        # Cap util to 0.90 max. Due to recent changes in vLLM/ROCm UMA
+        # available memory calculations (psutil.virtual_memory().available vs hipMemGetInfo),
+        # 0.95 often leads to OOM at startup on Strix Halo APUs.
+        util = float(best["util"])
         return {
             "ctx": best["max_context_1_user"],
-            "util": float(best["util"])
+            "util": min(0.90, util)
         }
-    except:
+        
+    except Exception as e:
         return default_config
 
 def configure_and_launch_vllm(model_idx, head_ip):
@@ -159,28 +165,37 @@ def configure_and_launch_vllm(model_idx, head_ip):
     current_ctx = verified["ctx"]
     current_util = verified["util"]
     
-    clear_cache = False
-    # Default to eager mode for stability in cluster situations, especially at high concurrency
-    use_eager = True
+    clear_cache = True  # Default ON: stale graphs from version upgrades cause crashes
+    # Default to eager mode for stability in cluster situations, unless explicitly disabled
+    use_eager = config.get("enforce_eager", True)
     trust_remote = True # Default True as per request
-    
+    attn_backends = ["Triton", "ROCm (CK)", "AITER"]
+    current_attn_backend = "Triton" # Default to Triton
+    current_extra_flags = list(config.get("extra_flags", []))  # Copy so edits don't mutate config
+
     while True:
         cache_status = "YES" if clear_cache else "NO"
         eager_status = "YES" if use_eager else "NO"
         trust_status = "YES" if trust_remote else "NO"
-        
+
+        extra_flags_display = ' '.join(current_extra_flags) if current_extra_flags else '(none)'
+        # Truncate display for menu readability
+        extra_flags_short = (extra_flags_display[:40] + '...') if len(extra_flags_display) > 43 else extra_flags_display
+
         menu_args = [
             "--clear", "--backtitle", f"AMD VLLM CLUSTER Launcher (Head: {head_ip})",
             "--title", f"Configuration: {name}",
-            "--menu", "Customize Launch Parameters:", "22", "65", "9",
+            "--menu", "Customize Launch Parameters:", "24", "70", "11",
             "1", f"Tensor Parallelism:   {current_tp} (Fixed)",
             "2", f"Concurrent Requests:  {current_seqs}",
             "3", f"Context Length:       {current_ctx}",
             "4", f"GPU Utilization:      {current_util}",
             "5", f"Trust Remote Code:    {trust_status}",
-            "6", f"Erase vLLM Cache:     {cache_status}",
-            "7", f"Force Eager Mode:     {eager_status}",
-            "8", "LAUNCH SERVER"
+            "6", f"Attention Backend:    {current_attn_backend}",
+            "7", f"Erase vLLM Cache:     {cache_status}",
+            "8", f"Force Eager Mode:     {eager_status}",
+            "9", f"Extra vLLM Flags:     {extra_flags_short}",
+            "10", "LAUNCH SERVER"
         ]
         
         choice = run_dialog(menu_args)
@@ -231,14 +246,31 @@ def configure_and_launch_vllm(model_idx, head_ip):
              
         elif choice == "5":
             trust_remote = not trust_remote
-             
+
         elif choice == "6":
-            clear_cache = not clear_cache
-            
+            idx = attn_backends.index(current_attn_backend)
+            current_attn_backend = attn_backends[(idx + 1) % len(attn_backends)]
+
         elif choice == "7":
-            use_eager = not use_eager
-            
+            clear_cache = not clear_cache
+
         elif choice == "8":
+            use_eager = not use_eager
+
+        elif choice == "9":
+            # Edit Extra vLLM Flags
+            current_str = ' '.join(current_extra_flags)
+            new_flags = run_dialog([
+                "--title", "Extra vLLM Flags",
+                "--inputbox",
+                "Edit extra flags (space-separated, passed directly to vllm serve).\n"
+                "Clear the field to remove all extra flags.",
+                "12", "70", current_str
+            ])
+            if new_flags is not None:  # None = cancelled
+                current_extra_flags = new_flags.split() if new_flags.strip() else []
+
+        elif choice == "10":
             break
             
     # Build Command
@@ -270,9 +302,9 @@ def configure_and_launch_vllm(model_idx, head_ip):
     env["NCCL_IB_GID_INDEX"] = "1"
     env["NCCL_NET_GDR_LEVEL"] = "0"
     
-    # Also need this for Ray backend?
-    # vLLM usually handles ray connection if we pass --distributed-executor-backend ray
-    
+    if current_attn_backend == "AITER":
+        env["VLLM_ROCM_USE_AITER"] = "1"
+        
     cmd = [
         "vllm", "serve", model_id,
         "--host", HOST,
@@ -283,8 +315,14 @@ def configure_and_launch_vllm(model_idx, head_ip):
         "--dtype", "auto"
     ]
 
-    if "Qwen3" in model_id:
-        cmd.extend(["--reasoning-parser", "qwen3"])
+    if current_attn_backend == "AITER":
+        cmd.extend(["--attention-backend", "ROCM_ATTN"])
+    elif current_attn_backend == "ROCm (CK)":
+        cmd.extend(["--attention-backend", "ROCM_ATTN"])
+    else:
+        cmd.extend(["--attention-backend", "TRITON_ATTN"])
+
+    cmd.extend(["--mm-encoder-attn-backend", "TRITON_ATTN"])
             
     if str(current_seqs) != "auto":
         cmd.extend(["--max-num-seqs", str(current_seqs)])
@@ -294,6 +332,10 @@ def configure_and_launch_vllm(model_idx, head_ip):
     
     if trust_remote: cmd.append("--trust-remote-code")
     if use_eager: cmd.append("--enforce-eager")
+
+    # Extra vLLM flags (from models.py defaults + user edits)
+    if current_extra_flags:
+        cmd.extend(current_extra_flags)
     
     print("\n" + "="*60)
     print(f" Launching VLLM Cluster on Head: {head_ip}")
@@ -301,6 +343,8 @@ def configure_and_launch_vllm(model_idx, head_ip):
     print(f" Config:    TP={current_tp} | Seqs={current_seqs} | Ctx={current_ctx}")
     if use_eager:
         print(" Note:      Eager Mode Enabled (Recommended for Cluster Stability)")
+    if current_extra_flags:
+        print(f" Extras:    {' '.join(current_extra_flags)}")
         
     print("\n --- Environment Variables ---")
     vars_to_print = [
@@ -310,6 +354,9 @@ def configure_and_launch_vllm(model_idx, head_ip):
         "NCCL_IB_GID_INDEX",
         "NCCL_NET_GDR_LEVEL"
     ]
+    if "VLLM_ROCM_USE_AITER" in env:
+        vars_to_print.append("VLLM_ROCM_USE_AITER")
+        
     for k in vars_to_print:
         if k in env:
             print(f" export {k}={env[k]}")

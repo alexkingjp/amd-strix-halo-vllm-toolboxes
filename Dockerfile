@@ -22,9 +22,12 @@ RUN /usr/bin/python3.12 -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONNOUSERSITE=1
 RUN printf 'source /opt/venv/bin/activate\n' > /etc/profile.d/venv.sh
 RUN python -m pip install --upgrade pip wheel packaging "setuptools<80.0.0"
 
+
+ARG TORCH_ROCM_VERSION=2.13.0a0+rocm7.14.0a20260608
 # 5. Install PyTorch & hipBLASLt from Source with gfx1151 Patches
 # --- Inject patches ---
 COPY patches/hipblaslt_gfx1151.patch /tmp/patches/hipblaslt_gfx1151.patch
@@ -83,32 +86,77 @@ RUN python -m pip install \
   --pre torchaudio torchvision && \
   # Fix caching/JSON serialization bug in recent PyTorch nightlies
   sed -i 's/json.dumps(config_dict, sort_keys=True)/json.dumps(config_dict, sort_keys=True, default=str)/g' /opt/venv/lib64/python3.12/site-packages/torch/_dynamo/utils.py
-
 WORKDIR /opt
 
-# Flash-Attention
+COPY scripts/patch_aiter_headers.py /opt/patch_aiter_headers.py
+RUN python -m pip install --upgrade cmake ninja packaging wheel numpy "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11 numba scipy
+
+
+# Flash-Attention & AITER
 ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 ENV LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH"
 
-RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
-  cd flash-attention &&\
-  git checkout main_perf &&\
-  python setup.py install && \
-  cd /opt && rm -rf /opt/flash-attention
+RUN git clone https://github.com/ROCm/flash-attention.git && \
+  cd flash-attention && \
+  git checkout main_perf && \
+  git submodule update --init third_party/aiter && \
+  cd third_party/aiter && \
+  git submodule update --init 3rdparty/composable_kernel && \
+  export CK_DIR="$(pwd)/3rdparty/composable_kernel" && \
+  python -m pip wheel --no-build-isolation --no-deps -w /tmp/dist -v . && \
+  python -m pip install --force-reinstall /tmp/dist/amd_aiter*.whl && \
+  python /opt/patch_aiter_headers.py && \
+  cd /opt/flash-attention && \
+  python -c "import re; f=open('setup.py','r'); t=f.read(); f.close(); t=re.sub(r'subprocess\.run\([\s\S]*?third_party/aiter[\s\S]*?check=True,\s*\)', 'pass # patched', t); f=open('setup.py','w'); f.write(t)" && \
+  pip install --no-build-isolation --no-deps . && \
+  cd /opt && rm -rf /opt/flash-attention /opt/patch_aiter_headers.py && \
+  (find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true) && \
+  rm -rf /root/.cache/pip
+
+# Fix Fedora lib vs lib64 split: setup.py install writes to lib/, pip to lib64/.
+# flash-attention's find_packages() may install a partial aiter copy into lib/.
+# Merge any straggler files from lib/ into lib64/ so Python finds everything.
+# When lib64 is a symlink to lib (Fedora's default venv layout), the two
+# site-packages dirs resolve to the same path — skip the merge, since the
+# cp-into-self then rm-rf would delete the entire aiter package.
+RUN lib_sp=/opt/venv/lib/python3.12/site-packages; \
+  lib64_sp=/opt/venv/lib64/python3.12/site-packages; \
+  if [ "$(readlink -f "$lib_sp")" != "$(readlink -f "$lib64_sp")" ] && \
+  [ -d "$lib_sp/aiter" ]; then \
+  cp -rn "$lib_sp/aiter/"* "$lib64_sp/aiter/" 2>/dev/null || true; \
+  rm -rf "$lib_sp/aiter"; \
+  fi
 
 # 6. Clone vLLM
+# Optional: pin to a specific vLLM commit for reproducible builds.
+# Defaults to empty (tracks upstream HEAD). Override with --build-arg VLLM_COMMIT=<sha>.
+ARG VLLM_COMMIT=752a3a5
 RUN git clone https://github.com/vllm-project/vllm.git /opt/vllm
 WORKDIR /opt/vllm
+RUN if [ -n "$VLLM_COMMIT" ]; then \
+  echo "Pinning vLLM to commit $VLLM_COMMIT" && git checkout "$VLLM_COMMIT"; \
+  fi
 
 # --- PATCHING ---
 COPY scripts/patch_strix.py /opt/vllm/patch_strix.py
-RUN python /opt/vllm/patch_strix.py && \
-  sed -i 's/gfx1200;gfx1201/gfx1151/' CMakeLists.txt && \
-  # Patch vllm/platforms/rocm.py to return True for is_fp8_fnuz() on gfx1151
-  sed -i 's/def is_fp8_fnuz().*/def is_fp8_fnuz():\n    return True\n\ndef _old_is_fp8_fnuz():/' vllm/platforms/rocm.py || true
+RUN python /opt/vllm/patch_strix.py
+
+# --- FP8 (W8A8) Strix Halo Triton kernels (EXPERIMENTAL / RFC — see issue #67) ---
+# Custom FP8 kernels by @leonyurko for gfx1151 (which has no native FP8). The kernel
+# modules live on PYTHONPATH (/opt/fp8); patch_fp8_kernels.py routes vLLM's
+# compressed-tensors W8A8-FP8 scaled-mm path through the fused Triton dequant-GEMM
+# (fp8_triton.fp8_gemm). Kept separate from patch_strix.py so it stays independent
+# of the is_integrated memory work. Serve FP8 models with VLLM_ROCM_USE_AITER=0 and
+# --enforce-eager (see the kernel repo's serve scripts).
+# https://github.com/leonyurko/vllm-fp8-strix-halo-kernel-support
+ARG FP8_KERNELS_REF=50424f5525b8382353551e3301d0da56eca0be2b
+RUN git clone https://github.com/leonyurko/vllm-fp8-strix-halo-kernel-support.git /opt/fp8 && \
+  cd /opt/fp8 && git checkout "$FP8_KERNELS_REF"
+COPY scripts/patch_fp8_kernels.py /opt/vllm/patch_fp8_kernels.py
+RUN python /opt/vllm/patch_fp8_kernels.py
+ENV PYTHONPATH=/opt/fp8
 
 # 7. Build vLLM (Wheel Method) with CLANG Host Compiler
-RUN python -m pip install --upgrade cmake ninja packaging wheel numpy "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11
 ENV ROCM_HOME="/opt/rocm"
 ENV HIP_PATH="/opt/rocm"
 ENV VLLM_TARGET_DEVICE="rocm"
@@ -123,11 +171,23 @@ ENV MAX_JOBS="4"
 ENV CC="/opt/rocm/llvm/bin/clang"
 ENV CXX="/opt/rocm/llvm/bin/clang++"
 
+# Recent vLLM main ships PyO3/Rust extension modules (vllm/_rust_*.so) for the
+# tool-call/reasoning parsers and tokenizer helpers. Building the wheel now
+# requires a Rust toolchain plus the setuptools-rust backend, otherwise the
+# build fails in metadata prep with "ModuleNotFoundError: No module named
+# 'setuptools_rust'". Installed right before the vLLM build so the expensive
+# flash-attention/AITER layers above stay cacheable.
+RUN dnf install -y rust cargo && dnf clean all && rm -rf /var/cache/dnf/* && \
+  python -m pip install "setuptools-rust>=1.9.0" && rm -rf /root/.cache/pip
+
 RUN export HIP_DEVICE_LIB_PATH=$(find /opt/rocm -type d -name bitcode -print -quit) && \
   echo "Compiling with Bitcode: $HIP_DEVICE_LIB_PATH" && \
   export CMAKE_ARGS="-DROCM_PATH=/opt/rocm -DHIP_PATH=/opt/rocm -DAMDGPU_TARGETS=gfx1151 -DHIP_ARCHITECTURES=gfx1151" && \   
   python -m pip wheel --no-build-isolation --no-deps -w /tmp/dist -v . && \
-  python -m pip install /tmp/dist/*.whl
+  python -m pip install /tmp/dist/*.whl && \
+  rm -rf /tmp/dist && \
+  (find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true) && \
+  rm -rf /root/.cache/pip
 
 RUN python -m pip install ray
 
@@ -149,12 +209,13 @@ RUN cmake -S . \
   -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
   && \
   make -j$(nproc) && \
-  python -m pip install --no-cache-dir . --no-build-isolation --no-deps
+  python -m pip install --no-cache-dir . --no-build-isolation --no-deps && \
+  (find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true) && \
+  rm -rf /root/.cache/pip
 
 # 8. Final Cleanup & Runtime
 WORKDIR /opt
-RUN chmod -R a+rwX /opt && \
-  find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true && \
+RUN (find /opt/venv -type f -name "*.so" -exec strip -s {} + 2>/dev/null || true) && \
   find /opt/venv -type d -name "__pycache__" -prune -exec rm -rf {} + && \
   rm -rf /root/.cache/pip || true && \
   dnf clean all && rm -rf /var/cache/dnf/*
